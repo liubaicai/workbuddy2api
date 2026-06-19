@@ -19,40 +19,42 @@
 - 🪶 **单文件、极简**：核心就一个 `converter.py`，不复杂。
 - 🔐 **零授权改动**：直接调用本机已登录的 `codebuddy` CLI，自动复用桌面端登录态，不重新登录、不存密码。
 - 🖥️ **跨平台**：自动定位 macOS / Windows / Linux 上的 CLI 与登录文件。
-- 🛡️ **安全**：默认只监听 `127.0.0.1`；调用 CLI 时禁用 CLI 内置工具，工具的声明与执行都由你的客户端负责。
+- 🛡️ **安全**：默认只监听 `127.0.0.1`；工具的声明与执行都由客户端负责，转换器只做鉴权与透传。
 - ⚡ **流式输出**：实时增量 token，体验与原生 OpenAI 流式一致。
 
 ### 🧠 它是怎么工作的
 
 ```
 ZCode / Cherry Studio / 任意 OpenAI 客户端
-        │  POST /v1/chat/completions  (OpenAI 协议)
+        │  POST /v1/chat/completions  (标准 OpenAI 协议，含 tools)
         ▼
 ┌────────────────────┐
 │  converter.py      │  ← 本地 FastAPI 服务 (127.0.0.1:8787)
-│  协议转换          │
+│  读 token + 注入   │
+│  鉴权 header + 透传│
 └────────────────────┘
-        │  codebuddy -p --output-format stream-json
+        │  POST /v2/chat/completions  (带 Authorization/X-User-Id 等头)
         ▼
-┌────────────────────┐
-│  CodeBuddy CLI     │  ← 自动复用桌面端登录态
-│  (GLM-5.2 / Kimi / │
-│   DeepSeek ...)    │
-└────────────────────┘
+┌────────────────────────────────┐
+│  copilot.tencent.com 后端      │  ← 原生标准 OpenAI 协议
+│  (GLM-5.2 / Kimi / DeepSeek)   │     含原生 tools / tool_calls / SSE 流式
+└────────────────────────────────┘
 ```
 
-转换器把 OpenAI 的 messages 翻译成 CLI 的 prompt，再把 CLI 的 `stream-json` 事件流（Anthropic 风格的 `content_block_delta` 等）实时转成 OpenAI 的 SSE chunk。
+转换器直连 CodeBuddy 后端（`copilot.tencent.com/v2/chat/completions`），该后端本身就是**标准 OpenAI chat/completions 协议**。转换器只做两件事：①读取本机登录凭据并注入鉴权 header；②在本地 `/v1/*` 与后端 `/v2/*` 之间透传。因为后端原生支持 `tools` / `tool_calls`，function calling 是模型自带能力，**无需任何 prompt 注入或文本解析**。token 过期时转换器会自动调刷新接口并回写。
+
+> 历史版本曾通过「调 CLI + `<tool_call>` 文本标签解析」实现 function calling，但在嵌套 agent（subagent）场景下，subagent 的输出会夹带标签污染对话。**v2.0 改为直连后端，彻底解决了这个问题。**
 
 ### 📦 前置条件
 
 1. 已安装并**登录** CodeBuddy / WorkBuddy 桌面端（[腾讯云 CodeBuddy 官网](https://www.codebuddy.ai/)）。转换器会自动在这些位置找登录态：
    - **macOS**：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/*.info`
    - **Windows**：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info`
-   - **Linux**：`~/.local/share/CodeBuddyExtension/Data/Public/auth/*.info`
-2. **Python 3.8+** 与 **Node.js**（CLI 是 node 脚本，桌面端自带）。
+   - **Linux**：`~/.local/share/CodeBuddyExtension\Data\Public\auth\*.info`
+2. **Python 3.8+**（无需 Node.js，不再依赖 CLI）。
 3. 安装依赖（一次性）：
    ```bash
-   pip install fastapi "uvicorn[standard]"
+   pip install fastapi "uvicorn[standard]" httpx
    ```
 
 ### 🚀 快速开始
@@ -63,26 +65,18 @@ git clone https://github.com/HanHan666666/codebuddy2openai.git
 cd codebuddy2openai
 
 # 2. 装依赖
-pip install fastapi "uvicorn[standard]"
+pip install fastapi "uvicorn[standard]" httpx
 
 # 3. 启动（确保 CodeBuddy 桌面端已登录）
 python3 converter.py
 # 看到「✅ 监听 http://127.0.0.1:8787」即成功
 ```
 
-启动时会做一次预检，打印找到的 CLI 和登录文件路径。
+启动时会做一次预检，打印账号信息和 token 状态。
 
-### 🛠️ Function Calling（工具调用）是怎么实现的
+### 🛠️ Function Calling（工具调用）
 
-CodeBuddy CLI 只能选它**内置**的工具（Bash/Read/Edit…），不能注入客户端自定义的工具。为了让 ZCode / Cherry Studio 等 agent 客户端的工具也能用，转换器做了这层适配：
-
-1. 客户端在请求里带上标准 OpenAI 的 `tools`（`[{"type":"function","function":{...}}]`）。
-2. 转换器把工具说明格式化后注入对话（并约定模型用 `<tool_call>{"name":...,"arguments":...}</tool_call>` 格式输出）。
-3. 调 CLI 时用 `--tools ""` 禁用其内置工具，让模型**只产出 tool call 文本、不自己执行**。
-4. 转换器解析模型输出里的 `<tool_call>` 块，转成 OpenAI 的 `tool_calls`（`finish_reason:"tool_calls"`）返回。
-5. 客户端执行完工具，把 `role:"tool"` 的结果再发回来，转换器拼回对话上下文，模型据此继续。
-
-这样**工具的声明和执行都由客户端负责**，转换器只做协议桥接——客户端能用自己的全部工具集。
+后端原生支持标准 OpenAI function calling。客户端（如 ZCode / Cherry Studio）在请求里带 `tools`，模型原生返回 `tool_calls`（`finish_reason:"tool_calls"`），客户端执行工具后把 `role:"tool"` 的结果回传即可——和直连 OpenAI 完全一致。流式、非流式、多轮工具调用都支持。
 
 ### 🔌 接入客户端
 

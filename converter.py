@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅能力包装成 OpenAI 兼容 API。
+codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼容 API。
 
-原理：
-  - 不碰登录/授权：直接调用本机已安装的 CodeBuddy CLI（`codebuddy -p`），
-    CLI 会自动复用桌面端登录态（读取 CodeBuddyExtension 下的 auth 文件）。
-  - 把 OpenAI 的 /v1/chat/completions 请求翻译成 CLI 的 `--output-format stream-json`
-    事件流，再转成 OpenAI 的响应（支持 stream 与非 stream）。
+原理（直连后端，原生 function calling）：
+  - 读取本机已登录的 CodeBuddy 桌面端凭据（auth 文件里的 token / uid / enterpriseId）。
+  - 直接转发到 CodeBuddy 后端 `https://copilot.tencent.com/v2/chat/completions`。
+    该后端本身就是标准 OpenAI chat/completions 协议（含原生 tools / tool_calls / SSE 流式）。
+  - 转换器只做两件事：①注入鉴权 header（Authorization / X-User-Id 等）
+    ②在本地 /v1/* 与后端 /v2/* 之间做路径映射与透传。
+  - token 过期时自动调 `/v2/plugin/auth/token/refresh` 刷新，并回写 auth 文件。
 
-跨平台：自动定位 CLI 与 auth 目录（macOS / Windows / Linux）。
-依赖：fastapi + uvicorn（pip install fastapi "uvicorn[standard]"）。
-安全：默认只监听 127.0.0.1；调 CLI 时禁用所有内置工具（--tools ""），仅纯对话。
+跨平台：自动定位 auth 目录（macOS / Windows / Linux）。
+依赖：fastapi + uvicorn + httpx（pip install fastapi "uvicorn[standard]" httpx）。
 
 用法：
   python3 converter.py                       # 默认 127.0.0.1:8787
   python3 converter.py --port 9000
-  python3 converter.py --api-key mysecret    # 启用鉴权
+  python3 converter.py --api-key mysecret    # 启用客户端鉴权
 """
 
 from __future__ import annotations
@@ -23,25 +24,30 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import shutil
-import subprocess
 import sys
+import threading
 import time
-import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Iterable, List, Optional
+from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 # ---------------------------------------------------------------------------
-# 平台相关：定位 CLI 与 auth 目录
+# 常量
+# ---------------------------------------------------------------------------
+
+BACKEND = "https://copilot.tencent.com"
+DEFAULT_DOMAIN = "www.codebuddy.cn"
+USER_AGENT = "codebuddy2openai/2.0"
+
+# ---------------------------------------------------------------------------
+# 平台相关：定位 auth 目录
 # ---------------------------------------------------------------------------
 
 def auth_dirs() -> list[Path]:
-    """桌面端登录态所在目录（与 app.asar 中 EXTENSION_DATA_DIR_NAME 一致）。"""
     home = Path.home()
     plat = sys.platform
     if plat == "darwin":
@@ -61,59 +67,117 @@ def find_auth_file() -> Path | None:
     return None
 
 
-def cli_candidates() -> list[Path]:
-    """所有可能的 CLI 可执行路径（按优先级）。"""
-    home = Path.home()
-    plat = sys.platform
-    cands: list[Path] = []
+# ---------------------------------------------------------------------------
+# Auth 凭据管理（读 + 自动刷新 + 回写）
+# ---------------------------------------------------------------------------
 
-    env = os.environ.get("CODEBUDDY_CODE_PATH")
-    if env:
-        cands.append(Path(env))
+class CredentialManager:
+    """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
 
-    if plat == "darwin":
-        for apps in (Path("/Applications"), home / "Applications"):
-            cands += list(apps.glob("**/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"))
-            cands += list(apps.glob("**/CodeBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"))
-    elif plat == "win32":
-        pf = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
-        pf86 = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
-        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-        for root in (pf, pf86, local):
-            cands += list(root.glob("**/[Ww]ork[Bb]uddy/**/cli/bin/codebuddy*"))
-            cands += list(root.glob("**/[Cc]ode[Bb]uddy/**/cli/bin/codebuddy*"))
-    else:
-        for opt in (Path("/opt"), home / ".local", home / ".codebuddy"):
-            cands += list(opt.glob("**/cli/bin/codebuddy"))
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._cached: dict | None = None
+        self._mtime: float = 0.0
 
-    for name in ("codebuddy", "cbc"):
-        p = shutil.which(name)
-        if p:
-            cands.append(Path(p))
+    def _read_raw(self) -> dict:
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    # 去重保序
-    seen: set[str] = set()
-    uniq: list[Path] = []
-    for c in cands:
-        k = str(c)
-        if k not in seen:
-            seen.add(k)
-            uniq.append(c)
-    return uniq
-
-
-def find_cli() -> Path | None:
-    for c in cli_candidates():
+    def _load_if_stale(self):
+        """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
         try:
-            if c.is_file():
-                return c
+            mt = self.path.stat().st_mtime
         except OSError:
-            continue
-    return None
+            return
+        if self._cached is None or mt != self._mtime:
+            self._cached = self._read_raw()
+            self._mtime = mt
+
+    def _session(self) -> dict:
+        self._load_if_stale()
+        if self._cached is None:
+            raise RuntimeError(f"无法读取 auth 文件：{self.path}")
+        return self._cached
+
+    def _is_expired(self) -> bool:
+        s = self._session()
+        expires_at = (s.get("auth") or {}).get("expiresAt") or 0
+        # 提前 60s 判定过期
+        return time.time() * 1000 >= (expires_at - 60_000)
+
+    def _refresh(self):
+        """调后端刷新 token，写回 auth 文件与缓存。"""
+        s = self._session()
+        auth = s.get("auth") or {}
+        headers = self._build_headers_from(auth, s.get("account") or {})
+        headers["X-Refresh-Token"] = auth.get("refreshToken", "")
+        headers["X-Auth-Refresh-Source"] = "plugin"
+        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        try:
+            with httpx.Client(timeout=15) as c:
+                r = c.post(url, headers=headers, json={})
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"刷新 token 网络失败：{e}")
+        if data.get("code") != 0 or not data.get("data"):
+            raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
+        new_auth = data["data"]
+        # 继承部分字段
+        new_auth["domain"] = new_auth.get("domain") or auth.get("domain")
+        new_auth["lastRefreshTime"] = int(time.time() * 1000)
+        # 计算 expiresAt（若后端没直接给）
+        if not new_auth.get("expiresAt") and new_auth.get("expiresIn"):
+            new_auth["expiresAt"] = int(time.time() * 1000) + new_auth["expiresIn"] * 1000
+        if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
+            new_auth["refreshExpiresAt"] = int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
+        s["auth"] = new_auth
+        # 原子写回
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+        self._cached = s
+        self._mtime = self.path.stat().st_mtime
+
+    def _build_headers_from(self, auth: dict, account: dict) -> dict:
+        domain = auth.get("domain") or DEFAULT_DOMAIN
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {auth.get('accessToken','')}",
+            "X-User-Id": account.get("uid", ""),
+            "X-Enterprise-Id": account.get("enterpriseId", ""),
+            "X-Tenant-Id": account.get("enterpriseId", ""),
+            "X-Domain": domain,
+            "User-Agent": USER_AGENT,
+        }
+        return h
+
+    def get_headers(self) -> dict:
+        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+        with self._lock:
+            if self._is_expired():
+                self._refresh()
+            s = self._session()
+            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+
+    def summary(self) -> dict:
+        s = self._session()
+        auth = s.get("auth") or {}
+        acct = s.get("account") or {}
+        exp = auth.get("expiresAt", 0)
+        return {
+            "uid": acct.get("uid"),
+            "nickname": acct.get("nickname"),
+            "enterpriseName": acct.get("enterpriseName"),
+            "token_expires_at": exp,
+            "token_expired": self._is_expired(),
+        }
 
 
 # ---------------------------------------------------------------------------
-# 模型列表（来自 CLI --help 的 --model 说明）
+# 模型列表
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODELS = [
@@ -123,413 +187,24 @@ DEFAULT_MODELS = [
     "minimax-m3-pay", "hy3-preview-agent", "auto",
 ]
 
-
-# ---------------------------------------------------------------------------
-# OpenAI messages -> CLI prompt
-# ---------------------------------------------------------------------------
-
-# 工具调用标签（模型按此约定输出，转换器解析）
-TOOL_CALL_OPEN = "<tool_call>"
-TOOL_CALL_CLOSE = "</tool_call>"
-
-# 注入到对话里的「可用工具说明 + 输出约定」
-TOOLS_SYSTEM_PROMPT = """\
-# Available tools
-You may call tools to help answer the user's request. Tools are described below as JSON Schemas.
-
-To call a tool, output ONLY this block and nothing else (no prose before or after):
-{open}
-{{"name": "<tool_name>", "arguments": {{<json object matching the tool's parameters>}}}}
-{close}
-
-Rules:
-- Output the {open}...{close} block verbatim. The JSON inside must be valid (double quotes, no trailing commas).
-- Call AT MOST ONE tool per turn. Wait for the result before continuing.
-- If you do not need a tool, answer the user directly in plain text.
-- "arguments" must match the tool's parameter schema. Omit unknown fields.
-
-## Tools
-""".format(open=TOOL_CALL_OPEN, close=TOOL_CALL_CLOSE)
-
-
-def _content_to_text(content) -> str:
-    if isinstance(content, list):
-        bits = []
-        for blk in content:
-            if isinstance(blk, dict) and blk.get("type") == "text":
-                bits.append(blk.get("text", ""))
-            elif isinstance(blk, str):
-                bits.append(blk)
-        return "\n".join(bits)
-    if not isinstance(content, str):
-        return str(content)
-    return content
-
-
-def _format_tools(tools: list[dict]) -> str:
-    """把 OpenAI tools（[{"type":"function","function":{...}}]）渲染成可读说明。"""
-    lines: list[str] = []
-    for t in tools or []:
-        if not isinstance(t, dict):
-            continue
-        fn = t.get("function") if t.get("type") == "function" else t
-        if not isinstance(fn, dict):
-            continue
-        name = fn.get("name", "?")
-        desc = (fn.get("description") or "").strip()
-        params = fn.get("parameters") or {}
-        lines.append(f"- {name}: {desc}")
-        # 简要列参数
-        props = params.get("properties") if isinstance(params, dict) else None
-        if isinstance(props, dict) and props:
-            required = params.get("required", []) if isinstance(params, dict) else []
-            pstrs = []
-            for pname, pinfo in props.items():
-                if not isinstance(pinfo, dict):
-                    continue
-                ptype = pinfo.get("type", "any")
-                pdesc = (pinfo.get("description") or "").strip().split("\n")[0]
-                req = "required" if pname in required else "optional"
-                pstrs.append(f'    - {pname} ({ptype}, {req}): {pdesc}')
-            if pstrs:
-                lines.append("  parameters:")
-                lines.extend(pstrs)
-    return "\n".join(lines)
-
-
-def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
-    """把 OpenAI messages 数组拼成纯文本 prompt，保留角色与多轮上下文。
-
-    若 tools 非空，注入工具说明，并处理 assistant 的 tool_calls 与 tool 结果。
-    """
-    parts: list[str] = []
-
-    # 1) 若有工具，先注入工具说明
-    if tools:
-        parts.append("[system]\n" + TOOLS_SYSTEM_PROMPT + _format_tools(tools))
-
-    # 2) 遍历 messages
-    for m in messages:
-        role = m.get("role", "user")
-        if role == "assistant" and m.get("tool_calls"):
-            # assistant 发起的工具调用：还原成约定的 <tool_call> 文本
-            calls = []
-            for tc in m.get("tool_calls") or []:
-                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                name = fn.get("name")
-                args = fn.get("arguments", "{}")
-                # arguments 可能是 JSON 字符串或对象
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        pass
-                calls.append(json.dumps({"name": name, "arguments": args}, ensure_ascii=False))
-            block = TOOL_CALL_OPEN + "\n" + "\n".join(calls) + "\n" + TOOL_CALL_CLOSE
-            extra = _content_to_text(m.get("content", "")).strip()
-            parts.append(f"[assistant]\n{block}" + (f"\n{extra}" if extra else ""))
-            continue
-
-        if role == "tool":
-            # 工具执行结果回传
-            tid = m.get("tool_call_id", "")
-            text = _content_to_text(m.get("content", "")).strip()
-            parts.append(f"[tool result{(' id=' + tid) if tid else ''}]\n{text}")
-            continue
-
-        text = _content_to_text(m.get("content", "")).strip()
-        if not text:
-            continue
-        tag = {"system": "system", "user": "user", "assistant": "assistant"}.get(role, role)
-        parts.append(f"[{tag}]\n{text}")
-
-    return "\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# 解析模型输出里的 <tool_call> 块 -> OpenAI tool_calls
-# ---------------------------------------------------------------------------
-
-_TOOL_CALL_RE = re.compile(
-    re.escape(TOOL_CALL_OPEN) + r"(.*?)" + re.escape(TOOL_CALL_CLOSE),
-    re.DOTALL,
-)
-
-
-def parse_tool_calls(text: str) -> list[dict]:
-    """从模型输出文本里解析所有 <tool_call> 块，返回 OpenAI tool_calls 列表（可能为空）。"""
-    calls: list[dict] = []
-    for m in _TOOL_CALL_RE.finditer(text):
-        raw = m.group(1).strip()
-        # 块里可能有多个 JSON（每行一个），也可能是一个对象
-        for cand in _split_json_objects(raw):
-            try:
-                obj = json.loads(cand)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            name = obj.get("name")
-            args = obj.get("arguments", {})
-            if name is None:
-                continue
-            if isinstance(args, (dict, list)):
-                args = json.dumps(args, ensure_ascii=False)
-            elif not isinstance(args, str):
-                args = json.dumps(args, ensure_ascii=False)
-            calls.append({
-                "id": "call_" + uuid.uuid4().hex[:24],
-                "type": "function",
-                "function": {"name": str(name), "arguments": args},
-            })
-    return calls
-
-
-def strip_tool_call_blocks(text: str) -> str:
-    """去掉所有 <tool_call> 块，返回剩余纯文本（用于 content 字段）。"""
-    cleaned = _TOOL_CALL_RE.sub("", text)
-    return cleaned.strip()
-
-
-def _split_json_objects(s: str) -> list[str]:
-    """把可能含多个 JSON 对象的字符串，按顶层 { } 边界切分。"""
-    objs: list[str] = []
-    depth = 0
-    start = -1
-    in_str = False
-    esc = False
-    for i, ch in enumerate(s):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                objs.append(s[start:i + 1])
-                start = -1
-    return objs
-
-
-# ---------------------------------------------------------------------------
-# 调用 CLI 并解析 stream-json 事件流
-# ---------------------------------------------------------------------------
-
-class CliError(RuntimeError):
-    pass
-
-
-def build_cli_argv(prompt: str, model: str | None) -> list[str]:
-    cli = find_cli()
-    if cli is None:
-        raise CliError(
-            "未找到 CodeBuddy CLI。请先安装并登录 CodeBuddy / WorkBuddy 桌面端，"
-            "或用环境变量 CODEBUDDY_CODE_PATH 指定 CLI 路径。"
-        )
-    node = shutil.which("node")
-    if cli.suffix.lower() in (".cmd", ".bat", "") and node:
-        argv = [node, str(cli)]  # bin/codebuddy 是 node 脚本
-    else:
-        argv = [str(cli)]
-    argv += [
-        "-p",                          # 非交互，打印后退出
-        "--output-format", "stream-json",
-        "--include-partial-messages",  # 增量 token 事件（流式用）
-        "--verbose",
-        "--tools", "",                 # 禁用所有内置工具，纯对话
-        "--model", model or "auto",
-        prompt,
-    ]
-    return argv
-
-
-def run_cli_stream(prompt: str, model: str | None, cwd: str) -> Iterable[dict]:
-    """
-    启动 CLI 子进程，逐行读取 stream-json，yield 解析后的事件 dict。
-    结束时检查退出码，非 0 抛 CliError。
-    """
-    argv = build_cli_argv(prompt, model)
-    env = dict(os.environ)
-    env.setdefault("CI", "1")
-    try:
-        proc = subprocess.Popen(
-            argv, cwd=cwd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
-    except FileNotFoundError as e:
-        raise CliError(f"无法启动 CLI：{e}")
-
-    assert proc.stdout is not None
-    try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 非 JSON 行（调试日志）忽略
-    finally:
-        proc.stdout.close()
-        rc = proc.wait()
-        if rc not in (0, None):
-            err = ""
-            if proc.stderr:
-                try:
-                    err = proc.stderr.read()
-                except Exception:
-                    err = ""
-            raise CliError(f"CLI 退出码 {rc}。{err[:500]}")
-
-
-# ---------------------------------------------------------------------------
-# 事件归一化：CLI 的 stream_event（Anthropic 风格）/ assistant / result -> 统一事件
-# ---------------------------------------------------------------------------
-
-def normalize_events(events: Iterable[dict]) -> Iterable[dict]:
-    """
-    yield:
-        {"kind": "delta", "text": "..."}
-        {"kind": "final", "text": "...", "usage": {...}, "stop_reason": "..."}
-        {"kind": "error", "message": "..."}
-    """
-    final_text_parts: list[str] = []
-    final_usage: dict | None = None
-    stop_reason: str | None = None
-    saw_result = False
-
-    for ev in events:
-        t = ev.get("type")
-
-        if t == "stream_event":
-            inner = ev.get("event", {})
-            if inner.get("type") == "content_block_delta":
-                delta = inner.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    txt = delta.get("text", "")
-                    if txt:
-                        yield {"kind": "delta", "text": txt}
-            continue
-
-        if t == "assistant":
-            msg = ev.get("message", {})
-            final_usage = msg.get("usage") or final_usage
-            stop_reason = msg.get("stop_reason") or stop_reason
-            for blk in msg.get("content", []) or []:
-                if isinstance(blk, dict) and blk.get("type") == "text":
-                    txt = blk.get("text", "")
-                    if txt:
-                        final_text_parts.append(txt)
-            continue
-
-        if t == "result":
-            saw_result = True
-            if ev.get("is_error"):
-                yield {"kind": "error", "message": str(ev.get("result", "未知错误"))}
-                return
-            if ev.get("usage"):
-                final_usage = ev["usage"]
-            if not final_text_parts and ev.get("result"):
-                final_text_parts.append(str(ev["result"]))
-            if ev.get("subtype") == "success_max_turns" and not stop_reason:
-                stop_reason = "max_tokens"
-            continue
-
-        if t == "system" and ev.get("subtype") == "error":
-            yield {"kind": "error", "message": str(ev.get("message", "CLI 系统错误"))}
-            return
-
-    if not saw_result and not final_text_parts:
-        yield {"kind": "error", "message": "CLI 未返回任何结果"}
-        return
-
-    yield {
-        "kind": "final",
-        "text": "".join(final_text_parts),
-        "usage": final_usage or {},
-        "stop_reason": stop_reason or "stop",
-    }
-
-
-# ---------------------------------------------------------------------------
-# OpenAI 响应构造
-# ---------------------------------------------------------------------------
-
-def _usage_to_openai(usage: dict | None) -> dict:
-    usage = usage or {}
-    inp = usage.get("input_tokens", 0)
-    out = usage.get("output_tokens", 0)
-    return {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}
-
-
-def make_chat_completion(text: str, model: str, usage: dict | None,
-                         tools: list[dict] | None = None) -> dict:
-    tool_calls = parse_tool_calls(text) if tools else []
-    if tool_calls:
-        # 模型发起了工具调用：返回 tool_calls，content 去掉 tool_call 块
-        content = strip_tool_call_blocks(text) or None
-        message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
-        finish = "tool_calls"
-    else:
-        message = {"role": "assistant", "content": text}
-        finish = "stop"
-    return {
-        "id": "chatcmpl-" + uuid.uuid4().hex,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish,
-        }],
-        "usage": _usage_to_openai(usage),
-    }
-
-
-def sse_chunk(cid: str, model: str, *, delta_content: str | None = None,
-              role: str | None = None, finish_reason: str | None = None,
-              tool_calls: list[dict] | None = None,
-              tool_call_index: int | None = None) -> str:
-    delta: dict = {}
-    if role is not None:
-        delta["role"] = role
-    if delta_content is not None:
-        delta["content"] = delta_content
-    if tool_calls is not None:
-        delta["tool_calls"] = tool_calls
-    chunk = {
-        "id": cid,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
+# 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
+PASSTHROUGH_BODY_KEYS = {
+    "model", "messages", "tools", "tool_choice", "temperature",
+    "max_tokens", "max_completion_tokens", "top_p", "stream",
+    "stream_options", "stop", "presence_penalty", "frequency_penalty",
+    "n", "response_format", "seed", "user", "reasoning_effort",
+    "verbosity", "reasoning_summary",
+}
 
 # ---------------------------------------------------------------------------
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="codebuddy2openai", version="1.0")
-
-# 运行时配置（由 main() 注入）
-CONFIG = {"api_key": "", "cwd": os.getcwd()}
+app = FastAPI(title="codebuddy2openai", version="2.0")
+CONFIG: dict = {"api_key": "", "cred": None}  # cred: CredentialManager | None
 
 
-def _check_auth(authorization: str | None, x_api_key: str | None):
+def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
     key = CONFIG["api_key"]
     if not key:
         return
@@ -542,15 +217,23 @@ def _check_auth(authorization: str | None, x_api_key: str | None):
         raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
 
 
+def _cred() -> CredentialManager:
+    if CONFIG["cred"] is None:
+        raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
+    return CONFIG["cred"]
+
+
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "platform": sys.platform,
-        "python": sys.version.split()[0],
-        "cli": str(find_cli() or "(未找到)"),
-        "auth_file": str(find_auth_file() or "(未找到)"),
-    }
+    cred = CONFIG["cred"]
+    info: dict = {"status": "ok", "platform": sys.platform, "python": sys.version.split()[0],
+                  "auth_file": str(find_auth_file() or "(未找到)"), "mode": "direct-proxy (native function calling)"}
+    if cred is not None:
+        try:
+            info["credential"] = cred.summary()
+        except Exception as e:
+            info["credential_error"] = str(e)
+    return info
 
 
 @app.get("/v1/models")
@@ -567,6 +250,7 @@ async def chat_completions(request: Request,
                            authorization: Optional[str] = Header(default=None),
                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_auth(authorization, x_api_key)
+    cred = _cred()
 
     try:
         payload = await request.json()
@@ -577,131 +261,144 @@ async def chat_completions(request: Request,
     if not messages:
         raise HTTPException(status_code=400, detail={"error": {"message": "messages is required", "type": "invalid_request_error"}})
 
-    model = payload.get("model") or "auto"
-    stream = bool(payload.get("stream"))
-    tools = payload.get("tools") or None
-    prompt = messages_to_prompt(messages, tools)
-    cwd = CONFIG["cwd"]
+    # 构造后端 body：只透传已知的合法字段
+    client_wants_stream = bool(payload.get("stream"))
+    body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
+    body.setdefault("model", "auto")
+    # 后端只支持流式：始终以 stream=True 调后端，非流式由转换器聚合
+    body["stream"] = True
+    if "stream_options" not in body:
+        body["stream_options"] = {"include_usage": True}
 
-    # 启动 CLI（同步子进程）；在异步上下文中放线程池执行，避免阻塞事件循环
-    import asyncio
-    loop = asyncio.get_event_loop()
+    headers = cred.get_headers()
+    url = f"{BACKEND}/v2/chat/completions"
 
-    def make_iter():
-        return run_cli_stream(prompt, model, cwd)
-
-    if stream:
+    if client_wants_stream:
         return StreamingResponse(
-            _stream_response(loop, make_iter, model, tools),
+            _stream_upstream(url, headers, body),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 非流式：在线程池里跑完
-    def run_all():
-        return list(normalize_events(make_iter()))
-
+    # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        events = await loop.run_in_executor(None, run_all)
-    except CliError as e:
-        raise HTTPException(status_code=502, detail={"error": {"message": str(e), "type": "upstream_error"}})
-
-    final_text, usage = "", None
-    for ev in events:
-        k = ev.get("kind")
-        if k == "final":
-            final_text = ev.get("text", "")
-            usage = ev.get("usage")
-        elif k == "error":
-            raise HTTPException(status_code=502, detail={"error": {"message": ev.get("message", "error"), "type": "upstream_error"}})
-    return JSONResponse(make_chat_completion(final_text, model, usage, tools))
+        async with httpx.AsyncClient(timeout=300) as c:
+            async with c.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    raw = await r.aread()
+                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
+                collected = await _collect_stream(r)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+    return JSONResponse(content=collected)
 
 
-async def _stream_response(loop, make_iter, model: str,
-                           tools: list[dict] | None = None) -> AsyncGenerator[bytes, None]:
-    """把 CLI 事件流转换成 OpenAI SSE。CLI 读取放到线程池里逐行消费。
+async def _collect_stream(response: httpx.Response) -> dict:
+    """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    有 tools 时：tool_calls 以文本形式产出且可能跨多个 delta，因此先缓冲完整文本，
-    再在结尾判断是否是工具调用（若是则输出 tool_calls，否则整段输出文本）。
-    无 tools 时：逐 delta 实时流式输出。
+    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
     """
-    import asyncio
-    cid = "chatcmpl-" + uuid.uuid4().hex
+    content_parts: list[str] = []
+    # tool_calls: index -> {id, name, arguments(分片拼接)}
+    tool_calls: dict[int, dict] = {}
+    model: str | None = None
+    finish_reason: str | None = None
+    usage: dict | None = None
 
-    yield sse_chunk(cid, model, role="assistant").encode("utf-8")
-
-    queue: asyncio.Queue = asyncio.Queue()
-    SENTINEL = object()
-
-    def producer():
-        try:
-            for ev in normalize_events(make_iter()):
-                asyncio.run_coroutine_threadsafe(queue.put(ev), loop).result()
-        except CliError as e:
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"kind": "error", "message": str(e)}), loop).result()
-        finally:
-            asyncio.run_coroutine_threadsafe(queue.put(SENTINEL), loop).result()
-
-    loop.run_in_executor(None, producer)
-
-    had_error = False
-
-    if tools:
-        # 有工具：缓冲完整文本，结尾统一判定
-        # 注意：normalize_events 先 yield 多个 delta，再 yield 一个 final（含完整文本）。
-        # final.text 已是完整文本，deltas 是它的片段，二者不可叠加，否则重复。
-        delta_parts: list[str] = []   # 仅在没收到 final 时兜底
-        final_text: str | None = None
-        while True:
-            item = await queue.get()
-            if item is SENTINEL:
-                break
-            k = item.get("kind")
-            if k == "delta":
-                delta_parts.append(item.get("text", ""))
-            elif k == "final":
-                final_text = item.get("text", "")
-            elif k == "error":
-                had_error = True
-                yield sse_chunk(cid, model, delta_content=f"[error] {item.get('message','')}").encode("utf-8")
-
-        full_text = final_text if final_text is not None else "".join(delta_parts)
-        tool_calls = parse_tool_calls(full_text)
-        if had_error:
-            yield sse_chunk(cid, model, finish_reason="error").encode("utf-8")
-        elif tool_calls:
-            # 流式发 tool_calls（OpenAI 约定：每个 call 一个 chunk，arguments 可分片）
-            for idx, tc in enumerate(tool_calls):
-                yield sse_chunk(cid, model, tool_calls=[{
-                    "index": idx,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
-                }]).encode("utf-8")
-            yield sse_chunk(cid, model, finish_reason="tool_calls").encode("utf-8")
-        else:
-            # 不是工具调用：把文本作为单个 content delta 发出
-            yield sse_chunk(cid, model, delta_content=full_text).encode("utf-8")
-            yield sse_chunk(cid, model, finish_reason="stop").encode("utf-8")
-        yield b"data: [DONE]\n\n"
-        return
-
-    # 无工具：逐 delta 实时流式
-    while True:
-        item = await queue.get()
-        if item is SENTINEL:
+    async for line in response.aiter_lines():
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
             break
-        k = item.get("kind")
-        if k == "delta":
-            yield sse_chunk(cid, model, delta_content=item.get("text", "")).encode("utf-8")
-        elif k == "error":
-            had_error = True
-            yield sse_chunk(cid, model, delta_content=f"[error] {item.get('message','')}").encode("utf-8")
-        # final: usage 暂不入 chunk（OpenAI 流式 usage 走可选的最后一个 chunk，这里略）
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        model = chunk.get("model") or model
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
 
-    yield sse_chunk(cid, model, finish_reason="error" if had_error else "stop").encode("utf-8")
-    yield b"data: [DONE]\n\n"
+    tcs = None
+    if tool_calls:
+        tcs = [
+            {"id": v["id"], "type": "function",
+             "function": {"name": v["name"], "arguments": v["arguments"]}}
+            for _, v in sorted(tool_calls.items())
+        ]
+        finish_reason = finish_reason or "tool_calls"
+
+    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if tcs:
+        message["tool_calls"] = tcs
+    return {
+        "id": "chatcmpl-" + os.urandom(12).hex(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or "unknown",
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": finish_reason or "stop"}],
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _safe_err_raw(raw: bytes, status: int) -> dict:
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
+
+
+async def _stream_upstream(url: str, headers: dict, body: dict):
+    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。"""
+    # token 在流式期间可能过期；此处简化处理（get_headers 已在请求前刷新）
+    try:
+        async with httpx.AsyncClient(timeout=None) as c:
+            async with c.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    err = await r.aread()
+                    yield _err_event(err, r.status_code)
+                    return
+                async for chunk in r.aiter_bytes():
+                    if chunk:
+                        yield chunk
+    except httpx.HTTPError as e:
+        yield _err_event(str(e).encode(), 502)
+
+
+def _safe_err(r: httpx.Response) -> dict:
+    try:
+        return {"error": r.json()}
+    except Exception:
+        return {"error": {"message": r.text[:500], "type": "upstream_error", "code": r.status_code}}
+
+
+def _err_event(msg: bytes, status: int) -> bytes:
+    # 以 OpenAI SSE 错误 chunk 形式返回
+    import json as _json, time as _time
+    chunk = {
+        "error": {"message": msg.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status},
+    }
+    return f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -709,46 +406,50 @@ async def _stream_response(loop, make_iter, model: str,
 # ---------------------------------------------------------------------------
 
 def preflight() -> bool:
-    cli = find_cli()
-    auth = find_auth_file()
+    af = find_auth_file()
     sys.stderr.write("==== 预检 ====\n")
     sys.stderr.write(f"平台      : {sys.platform}\n")
     sys.stderr.write(f"Python    : {sys.version.split()[0]}\n")
-    sys.stderr.write(f"CLI       : {cli or '(未找到)'}\n")
-    sys.stderr.write(f"登录文件  : {auth or '(未找到)'}\n")
+    sys.stderr.write(f"后端      : {BACKEND} (直连，原生 function calling)\n")
+    sys.stderr.write(f"登录文件  : {af or '(未找到)'}\n")
     if auth_dirs():
         sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
     ok = True
-    if cli is None:
-        sys.stderr.write("\n[警告] 未找到 CodeBuddy CLI。请安装 WorkBuddy/CodeBuddy 桌面端，\n"
-                         "       或设置环境变量 CODEBUDDY_CODE_PATH 指向 CLI。\n")
+    if af is None:
+        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n")
         ok = False
-    if auth is None:
-        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录。\n")
-        ok = False
+    else:
+        try:
+            cm = CredentialManager(af)
+            info = cm.summary()
+            sys.stderr.write(f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n")
+            sys.stderr.write(f"token过期 : {'是(将自动刷新)' if info['token_expired'] else '否'}\n")
+        except Exception as e:
+            sys.stderr.write(f"[警告] 读取凭据失败：{e}\n")
+            ok = False
     sys.stderr.write("================\n")
     return ok
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器")
+    ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
-    ap.add_argument("--cwd", default=os.getcwd(), help="CLI 工作目录（默认跟随当前目录）")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
-    CONFIG["cwd"] = args.cwd
+    af = find_auth_file()
+    CONFIG["cred"] = CredentialManager(af) if af else None
 
     if not args.skip_check:
         preflight()
 
-    sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}\n")
+    sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
     sys.stderr.write("   GET  /v1/models\n")
-    sys.stderr.write("   POST /v1/chat/completions   (支持 stream:true)\n")
+    sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
