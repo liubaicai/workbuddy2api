@@ -22,3 +22,5 @@ Thumbs.db
 *.key
 secrets.*
 
+.config/*
+!.config/.gitkeep

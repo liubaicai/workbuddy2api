@@ -1,14 +1,21 @@
 version: "3.8"
 
 services:
-  codebuddy2openai:
+  workbuddy2openai:
     build: .
-    container_name: codebuddy2openai
+    container_name: workbuddy2openai
     ports:
       - "8787:8787"
     volumes:
-      # 挂载宿主机的 CodeBuddy 登录凭据（macOS 示例，请按你的系统修改路径）
-      - ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+      # 挂载宿主机 CodeBuddy 授权目录（参考路径，请根据平台修改）
+      # macOS:
+      #   - ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+      # Windows:
+      #   - %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+      # Linux:
+      #   - ~/.local/share/CodeBuddyExtension/Data/Public/auth:/data/auth:ro
+      # 持久化上传的授权文件和激活状态
+      - ./config:/app/.config
     environment:
       # 如需鉴权，设置 API Key（客户端请求时需携带相同的 key）
       - CODEBUDDY2OPENAI_KEY=

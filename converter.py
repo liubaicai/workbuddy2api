@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼容 API。
+workbuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼容 API。
 
 原理（直连后端，原生 function calling）：
   - 读取本机已登录的 CodeBuddy 桌面端凭据（auth 文件里的 token / uid / enterpriseId）。
@@ -31,8 +31,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 
 try:
@@ -59,7 +59,7 @@ from anthropic_adapter import (
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+USER_AGENT = "workbuddy2openai/2.0"
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -80,17 +80,66 @@ def auth_dirs() -> list[Path]:
     return [xdg / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
 
 
+def _config_dir() -> Path:
+    """获取程序 .config 目录（相对于 converter.py 所在目录）。"""
+    return Path(__file__).resolve().parent / ".config"
+
+
+def _active_auth_file() -> Path:
+    """存储当前激活的授权文件名的标记文件。"""
+    return _config_dir() / "active.txt"
+
+
+def _get_active_auth_path() -> Path | None:
+    """读取当前激活的授权文件路径。"""
+    af = _active_auth_file()
+    if af.is_file():
+        try:
+            content = af.read_text(encoding="utf-8").strip()
+            if content:
+                p = Path(content)
+                if p.is_file():
+                    return p
+        except OSError:
+            pass
+    return None
+
+
+def _set_active_auth(path: Path | str | None):
+    """写入当前激活的授权文件路径。"""
+    _config_dir().mkdir(parents=True, exist_ok=True)
+    af = _active_auth_file()
+    if path:
+        af.write_text(str(path), encoding="utf-8")
+    elif af.is_file():
+        af.unlink()
+
+
 def find_auth_file() -> Path | None:
+    # 1) 优先使用显式激活的上传文件
+    active = _get_active_auth_path()
+    if active:
+        return active
+
+    # 2) 检查 .config 目录中的上传文件
+    config_dir = _config_dir()
+    if config_dir.is_dir():
+        files = sorted(config_dir.glob("uploaded_*.info"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+        if len(files) == 1:
+            # 只有一个时自动激活
+            _set_active_auth(files[0])
+            return files[0]
+        if len(files) > 1:
+            # 多个但无激活标记，不自动选择，回退到系统 auth_dirs
+            pass
+
+    # 3) 回退到系统默认 auth 目录
     for d in auth_dirs():
         if d.is_dir():
             for f in sorted(d.glob("*.info")):
                 return f
     return None
-
-
-# ---------------------------------------------------------------------------
-# Auth 凭据管理（读 + 自动刷新 + 回写）
-# ---------------------------------------------------------------------------
 
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
@@ -221,9 +270,10 @@ PASSTHROUGH_BODY_KEYS = {
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="codebuddy2openai", version="2.0")
+app = FastAPI(title="workbuddy2openai", version="2.0")
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
-                "desensitize": False, "no_compact": False}  # cred: CredentialManager | None
+                "desensitize": False, "no_compact": False,
+                "models_cache": None, "models_cache_ts": 0}  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +318,16 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
 
 
 def _cred() -> CredentialManager:
-    if CONFIG["cred"] is None:
+    cred = CONFIG.get("cred")
+    # 解析当前应使用的授权文件
+    af = find_auth_file()
+    if af is not None:
+        if cred is None or str(cred.path) != str(af):
+            cred = CredentialManager(af)
+            CONFIG["cred"] = cred
+    if cred is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
-    return CONFIG["cred"]
+    return cred
 
 
 @app.get("/health")
@@ -287,12 +344,45 @@ def health():
 
 
 @app.get("/v1/models")
-def list_models(authorization: Optional[str] = Header(default=None),
+async def list_models(authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_auth(authorization, x_api_key)
-    data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in DEFAULT_MODELS]
-    return {"object": "list", "data": data}
+
+    # 尝试从上游获取真实模型列表（缓存 5 分钟）
+    now = time.time()
+    cache = CONFIG.get("models_cache")
+    cache_ts = CONFIG.get("models_cache_ts", 0)
+    if cache and (now - cache_ts) < 300:
+        return cache
+
+    cred = CONFIG.get("cred")
+    data = []
+    if cred is not None:
+        try:
+            headers = cred.get_headers()
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"{BACKEND}/v2/models", headers=headers)
+            if r.status_code == 200:
+                upstream = r.json()
+                items = upstream.get("data") or upstream.get("models") or []
+                data = [
+                    {"id": m.get("id") or m.get("name") or str(m),
+                     "object": "model", "created": m.get("created", 1700000000),
+                     "owned_by": m.get("owned_by", "codebuddy")}
+                    for m in items
+                ]
+        except Exception:
+            pass
+
+    # 上游获取失败时回退到静态列表
+    if not data:
+        data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
+                for m in DEFAULT_MODELS]
+
+    result = {"object": "list", "data": data}
+    CONFIG["models_cache"] = result
+    CONFIG["models_cache_ts"] = now
+    return result
 
 
 @app.post("/v1/chat/completions")
@@ -852,6 +942,402 @@ async def count_tokens(request: Request,
 
 
 # ---------------------------------------------------------------------------
+# 管理页面（根路由）
+# ---------------------------------------------------------------------------
+
+ROOT_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>workbuddy2api — 管理面板</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         max-width: 860px; margin: 2em auto; padding: 0 1em; line-height: 1.6; }
+  h1 { font-size: 1.5em; margin-bottom: 0.2em; }
+  .sub { color: #888; font-size: 0.9em; margin-bottom: 1.5em; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 1em 1.2em; margin-bottom: 1.2em; }
+  .card h2 { margin-top: 0; font-size: 1.1em; }
+  .ok { color: #2da44e; } .err { color: #cf222e; } .warn { color: #d4a72c; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 4px 0; }
+  td:first-child { color: #666; width: 10em; }
+  .models { display: flex; flex-wrap: wrap; gap: 6px; }
+  .models span { background: #eee; border-radius: 4px; padding: 2px 8px; font-size: 0.85em; }
+  input[type=file] { margin: 8px 0; }
+  button { padding: 4px 12px; cursor: pointer; border: 1px solid #888; border-radius: 4px; background: #f0f0f0; }
+  button:hover { background: #ddd; }
+  button.danger { border-color: #cf222e; color: #cf222e; }
+  button.danger:hover { background: #fee; }
+  .msg { margin-top: 8px; font-size: 0.9em; }
+  .auth-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  .auth-table td, .auth-table th { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: left; font-size: 0.9em; }
+  .auth-table th { color: #888; font-weight: normal; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 0.8em; }
+  .badge-ok { background: #dafbe1; color: #1a7f37; }
+  .badge-err { background: #ffebe9; color: #cf222e; }
+  .badge-warn { background: #fff8c5; color: #9a6700; }
+  .btn-sm { font-size: 0.8em; padding: 2px 8px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #ddd; }
+    .card { border-color: #444; }
+    .models span { background: #333; }
+    td:first-child, .auth-table th { color: #aaa; }
+    button { background: #333; border-color: #555; color: #ddd; }
+    button:hover { background: #444; }
+    button.danger:hover { background: #422; }
+    .auth-table td, .auth-table th { border-color: #333; }
+    .badge-ok { background: #1a3d2b; color: #57ab5a; }
+    .badge-err { background: #3d1a1f; color: #f47067; }
+    .badge-warn { background: #3d3100; color: #d4a72c; }
+  }
+</style>
+</head>
+<body>
+<h1>WorkBuddy2API</h1>
+<div class="sub">CodeBuddy / WorkBuddy → OpenAI 兼容 API 转换器</div>
+
+<div class="card">
+  <h2>健康状态</h2>
+  <div id="health">加载中…</div>
+</div>
+
+<div class="card">
+  <h2>上传授权文件</h2>
+  <p style="font-size:0.85em;color:#888;">上传 CodeBuddy 的 <code>*.info</code> 授权文件。上传后自动激活。</p>
+  <input type="file" id="authFile" accept=".info">
+  <button onclick="uploadAuth()">上传</button>
+  <div class="msg" id="uploadMsg"></div>
+</div>
+
+<div class="card">
+  <h2>授权文件管理</h2>
+  <div id="authList">加载中…</div>
+  <div class="msg" id="authMsg"></div>
+</div>
+
+<div class="card">
+  <h2>模型列表</h2>
+  <div class="models" id="models">加载中…</div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function loadHealth() {
+  try {
+    const r = await fetch('/health');
+    const data = await r.json();
+    let cred = data.credential || {};
+    let html = '<table>';
+    html += `<tr><td>状态</td><td><span class="ok">${data.status}</span></td></tr>`;
+    html += `<tr><td>平台</td><td>${data.platform}</td></tr>`;
+    html += `<tr><td>Python</td><td>${data.python}</td></tr>`;
+    html += `<tr><td>后端</td><td>直连 (copilot.tencent.com)</td></tr>`;
+    html += `<tr><td>当前授权</td><td>${data.auth_file || '(未找到)'}</td></tr>`;
+    if (data.credential) {
+      html += `<tr><td>账号</td><td>${cred.nickname || '-'} / ${cred.enterpriseName || '-'}</td></tr>`;
+      html += `<tr><td>UID</td><td>${cred.uid || '-'}</td></tr>`;
+      html += `<tr><td>Token 状态</td><td><span class="${cred.token_expired ? 'err' : 'ok'}">${cred.token_expired ? '已过期（将自动刷新）' : '有效'}</span></td></tr>`;
+    } else if (data.credential_error) {
+      html += `<tr><td>凭据错误</td><td><span class="err">${data.credential_error}</span></td></tr>`;
+    }
+    html += '</table>';
+    $('health').innerHTML = html;
+  } catch(e) {
+    $('health').innerHTML = `<span class="err">加载失败: ${e}</span>`;
+  }
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch('/v1/models');
+    const data = await r.json();
+    let html = '';
+    for (const m of data.data || []) {
+      html += `<span>${m.id}</span>`;
+    }
+    $('models').innerHTML = html || '<span class="warn">无模型</span>';
+  } catch(e) {
+    $('models').innerHTML = `<span class="err">加载失败: ${e}</span>`;
+  }
+}
+
+async function loadAuthFiles() {
+  try {
+    const r = await fetch('/auth-files');
+    const data = await r.json();
+    let html = '';
+    const files = data.files || [];
+    if (files.length === 0) {
+      html = '<span style="color:#888;">暂无上传的授权文件</span>';
+      if (data.system_auth_file) {
+        html += `<br><span style="font-size:0.85em;color:#888;">当前使用系统默认授权: ${data.system_auth_file}</span>`;
+      }
+    } else {
+      html = '<table class="auth-table"><tr><th></th><th>账号</th><th>UID</th><th>Token</th><th>状态</th><th>操作</th></tr>';
+      for (const f of files) {
+        let statusBadge = '';
+        if (f.active) {
+          statusBadge = '<span class="badge badge-ok">当前使用</span>';
+        } else if (!f.token_valid) {
+          statusBadge = '<span class="badge badge-err">无效</span>';
+        } else {
+          statusBadge = '<span class="badge badge-warn">待激活</span>';
+        }
+        let tokenBadge = f.token_valid
+          ? '<span class="badge badge-ok">有效</span>'
+          : '<span class="badge badge-err">' + (f.error || '过期/无效') + '</span>';
+        let actions = '';
+        if (!f.active) {
+          actions += `<button class="btn-sm" onclick="activateAuth('${f.filename}')">激活</button> `;
+        }
+        actions += `<button class="btn-sm danger" onclick="deleteAuth('${f.filename}')">删除</button>`;
+        html += `<tr>
+          <td>${f.filename}</td>
+          <td>${f.nickname || '-'}</td>
+          <td>${f.uid || '-'}</td>
+          <td>${tokenBadge}</td>
+          <td>${statusBadge}</td>
+          <td>${actions}</td>
+        </tr>`;
+      }
+      html += '</table>';
+      if (data.system_auth_file) {
+        html += `<div style="margin-top:8px;font-size:0.8em;color:#888;">系统默认: ${data.system_auth_file}</div>`;
+      }
+    }
+    $('authList').innerHTML = html;
+  } catch(e) {
+    $('authList').innerHTML = `<span class="err">加载失败: ${e}</span>`;
+  }
+}
+
+async function uploadAuth() {
+  const file = $('authFile').files[0];
+  const msg = $('uploadMsg');
+  if (!file) { msg.innerHTML = '<span class="err">请先选择文件</span>'; return; }
+  const form = new FormData();
+  form.append('file', file);
+  msg.innerHTML = '上传中…';
+  try {
+    const r = await fetch('/upload-auth', { method: 'POST', body: form });
+    const data = await r.json();
+    if (r.ok) {
+      msg.innerHTML = `<span class="ok">✓ ${data.message}</span>`;
+      $('authFile').value = '';
+      loadHealth();
+      loadAuthFiles();
+    } else {
+      msg.innerHTML = `<span class="err">✗ ${data.detail?.error?.message || data.detail || JSON.stringify(data)}</span>`;
+    }
+  } catch(e) {
+    msg.innerHTML = `<span class="err">上传失败: ${e}</span>`;
+  }
+}
+
+async function activateAuth(filename) {
+  try {
+    const r = await fetch('/auth-files/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      loadHealth();
+      loadAuthFiles();
+    } else {
+      $('authMsg').innerHTML = `<span class="err">✗ ${data.detail?.error?.message || JSON.stringify(data)}</span>`;
+    }
+  } catch(e) {
+    $('authMsg').innerHTML = `<span class="err">激活失败: ${e}</span>`;
+  }
+}
+
+async function deleteAuth(filename) {
+  if (!confirm(`确定删除 ${filename} 吗？`)) return;
+  try {
+    const r = await fetch('/auth-files/delete', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      loadHealth();
+      loadAuthFiles();
+    } else {
+      $('authMsg').innerHTML = `<span class="err">✗ ${data.detail?.error?.message || JSON.stringify(data)}</span>`;
+    }
+  } catch(e) {
+    $('authMsg').innerHTML = `<span class="err">删除失败: ${e}</span>`;
+  }
+}
+
+loadHealth();
+loadModels();
+loadAuthFiles();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/")
+async def root():
+    return HTMLResponse(content=ROOT_HTML)
+
+
+@app.post("/upload-auth")
+async def upload_auth(file: UploadFile = File(...),
+                      authorization: Optional[str] = Header(default=None),
+                      x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """上传授权文件，程序将使用该文件替代默认路径查找凭据。"""
+    _check_auth(authorization, x_api_key)
+    if not file.filename or not file.filename.endswith(".info"):
+        raise HTTPException(status_code=400, detail={"error": {"message": "仅支持 .info 格式的授权文件", "type": "invalid_request_error"}})
+    try:
+        content = await file.read()
+        data = json.loads(content.decode("utf-8"))
+        if "auth" not in data and "account" not in data:
+            raise ValueError("文件格式不正确，缺少 auth/account 字段")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail={"error": {"message": f"文件格式无效: {e}", "type": "invalid_request_error"}})
+
+    # 检查是否已存在相同 UID 的授权文件，有则替换
+    new_uid = (data.get("account") or {}).get("uid") or (data.get("auth") or {}).get("uid") or ""
+    config_dir = _config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    replaced: Path | None = None
+    if new_uid:
+        for existing in sorted(config_dir.glob("uploaded_*.info")):
+            try:
+                ed = json.loads(existing.read_bytes().decode("utf-8"))
+                euid = (ed.get("account") or {}).get("uid") or (ed.get("auth") or {}).get("uid") or ""
+                if euid and euid == new_uid:
+                    replaced = existing
+                    break
+            except Exception:
+                pass
+
+    if replaced:
+        saved_path = replaced
+        action = "替换"
+    else:
+        saved_path = config_dir / f"uploaded_{os.urandom(6).hex()}.info"
+        action = "新增"
+    with open(saved_path, "wb") as f:
+        f.write(content)
+
+    # 自动激活新上传的文件
+    _set_active_auth(saved_path)
+    CONFIG["cred"] = CredentialManager(saved_path)
+
+    info = CONFIG["cred"].summary()
+    _log(f"▲ {action}授权文件: {saved_path} | uid={info.get('uid')} | nickname={info.get('nickname')}")
+    return {
+        "message": f"授权文件已{action}，账号: {info.get('nickname') or info.get('uid')}",
+        "credential": info,
+        "path": str(saved_path),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 授权文件管理
+# ---------------------------------------------------------------------------
+
+@app.get("/auth-files")
+async def list_auth_files(authorization: Optional[str] = Header(default=None),
+                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """列出 .config 中所有授权文件及其状态。"""
+    _check_auth(authorization, x_api_key)
+    active = _get_active_auth_path()
+    config_dir = _config_dir()
+    files = []
+    if config_dir.is_dir():
+        for f in sorted(config_dir.glob("uploaded_*.info"), key=lambda x: x.stat().st_mtime, reverse=True):
+            info: dict = {
+                "filename": f.name,
+                "path": str(f),
+                "active": active is not None and str(f) == str(active),
+                "mtime": f.stat().st_mtime,
+            }
+            # 尝试读取账号信息和 token 状态
+            try:
+                cm = CredentialManager(f)
+                s = cm.summary()
+                info["nickname"] = s.get("nickname") or "-"
+                info["uid"] = s.get("uid") or "-"
+                info["enterpriseName"] = s.get("enterpriseName") or "-"
+                info["token_expired"] = s.get("token_expired", True)
+                info["token_valid"] = not s.get("token_expired", True)
+            except Exception:
+                info["token_valid"] = False
+                info["error"] = "无法读取凭据"
+            files.append(info)
+    # 也检查系统 auth 目录（作为参考）
+    sys_file = None
+    for d in auth_dirs():
+        if d.is_dir():
+            for f in sorted(d.glob("*.info")):
+                sys_file = str(f)
+                break
+    return {
+        "files": files,
+        "active": str(active) if active else None,
+        "system_auth_file": sys_file,
+    }
+
+
+@app.post("/auth-files/activate")
+async def activate_auth_file(request: Request,
+                             authorization: Optional[str] = Header(default=None),
+                             x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """激活指定授权文件。"""
+    _check_auth(authorization, x_api_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": {"message": "bad json", "type": "invalid_request_error"}})
+    filename = (body or {}).get("filename")
+    if not filename:
+        raise HTTPException(status_code=400, detail={"error": {"message": "缺少 filename 参数", "type": "invalid_request_error"}})
+    target = _config_dir() / filename
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail={"error": {"message": f"文件不存在: {filename}", "type": "invalid_request_error"}})
+    _set_active_auth(target)
+    CONFIG["cred"] = CredentialManager(target)
+    info = CONFIG["cred"].summary()
+    _log(f"▲ 激活授权文件: {target} | uid={info.get('uid')} | nickname={info.get('nickname')}")
+    return {"message": f"已激活: {info.get('nickname') or info.get('uid')}", "filename": filename, "active": str(target)}
+
+
+@app.delete("/auth-files/delete")
+async def delete_auth_file(request: Request,
+                           authorization: Optional[str] = Header(default=None),
+                           x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """删除指定授权文件。不能删除当前激活的文件。"""
+    _check_auth(authorization, x_api_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": {"message": "bad json", "type": "invalid_request_error"}})
+    filename = (body or {}).get("filename")
+    if not filename:
+        raise HTTPException(status_code=400, detail={"error": {"message": "缺少 filename 参数", "type": "invalid_request_error"}})
+    target = _config_dir() / filename
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail={"error": {"message": f"文件不存在: {filename}", "type": "invalid_request_error"}})
+    active = _get_active_auth_path()
+    if active and str(target) == str(active):
+        raise HTTPException(status_code=400, detail={"error": {"message": "不能删除当前激活的授权文件，请先激活其他文件", "type": "invalid_request_error"}})
+    target.unlink()
+    _log(f"▲ 删除授权文件: {target}")
+    return {"message": f"已删除: {filename}"}
+
+
+# ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
 
@@ -912,10 +1398,15 @@ def main():
         preflight()
 
     sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
+    sys.stderr.write("   GET  /                        管理面板\n")
     sys.stderr.write("   GET  /v1/models\n")
     sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
     sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
     sys.stderr.write("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n")
+    sys.stderr.write("   POST /upload-auth           上传授权文件\n")
+    sys.stderr.write("   GET  /auth-files            授权文件列表\n")
+    sys.stderr.write("   POST /auth-files/activate   激活授权文件\n")
+    sys.stderr.write("   DEL  /auth-files/delete     删除授权文件\n")
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
@@ -924,6 +1415,7 @@ def main():
     if args.desensitize:
         mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
         sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
+    sys.stderr.write(f"   配置目录  : {_config_dir()}\n")
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
